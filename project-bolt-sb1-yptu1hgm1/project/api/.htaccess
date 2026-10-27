@@ -1,0 +1,3 @@
+<FilesMatch "^(bootstrap|migrate|router)\.php$">
+  Require all denied
+</FilesMatch>

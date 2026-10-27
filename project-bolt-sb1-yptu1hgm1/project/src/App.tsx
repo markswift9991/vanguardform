@@ -1,13 +1,16 @@
 import { useState, useEffect, useCallback } from "react";
-import { supabase } from "@/lib/supabase";
+import { apiRequest } from "@/lib/api";
 import { RiderHeader } from "@/components/RiderHeader";
-import { RiderForm, type RiderFormValues } from "@/components/RiderForm";
+import { RiderForm } from "@/components/RiderForm";
 import { SuccessScreen, type GuarantorLinkInfo } from "@/components/SuccessScreen";
 import { GuarantorForm } from "@/components/GuarantorForm";
-import type { GuarantorSubmission } from "@/types";
-import { Truck, Loader2, AlertCircle } from "lucide-react";
+import { AdminDashboard } from "@/components/AdminDashboard";
+import { AdminManagementPage } from "@/components/AdminManagementPage";
+import { useFormContent } from "@/lib/useFormContent";
+import type { GuarantorSubmission, LocationData, RiderFormValues } from "@/types";
+import { AlertCircle, Loader2 } from "lucide-react";
 
-type View = "rider" | "success" | "guarantor" | "guarantor-used" | "guarantor-error";
+type View = "rider" | "success" | "guarantor" | "guarantor-used" | "guarantor-error" | "guarantor-complete";
 
 interface GuarantorContext {
   token: string;
@@ -18,11 +21,16 @@ interface GuarantorContext {
 }
 
 function App() {
+  const { text } = useFormContent();
+  const [currentHash, setCurrentHash] = useState(window.location.hash);
   const [view, setView] = useState<View>("rider");
   const [links, setLinks] = useState<GuarantorLinkInfo[]>([]);
   const [riderName, setRiderName] = useState("");
   const [guarantorCtx, setGuarantorCtx] = useState<GuarantorContext | null>(null);
   const [loadingGuarantor, setLoadingGuarantor] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [submitError, setSubmitError] = useState("");
+  const [telegramWarning, setTelegramWarning] = useState("");
 
   // Route detection: #/guarantor/<token> or ?guarantor=<token>
   const detectGuarantorRoute = useCallback(async () => {
@@ -38,28 +46,24 @@ function App() {
 
     setLoadingGuarantor(true);
     try {
-      const { data, error } = await supabase
-        .from("guarantors")
-        .select("id, name, phone_number, status, verification_token, riders(full_name)")
-        .eq("verification_token", token)
-        .maybeSingle();
-
-      if (error || !data) {
-        setView("guarantor-error");
-        return;
-      }
+      const data = await apiRequest<{
+        id: string;
+        status: string;
+        rider_name: string;
+        guarantor_name: string;
+        guarantor_phone: string;
+      }>(`/api/guarantors/${encodeURIComponent(token)}`);
 
       if (data.status !== "pending") {
         setView("guarantor-used");
         return;
       }
 
-      const riderNameValue = (data.riders as unknown as { full_name: string }).full_name;
       setGuarantorCtx({
-        token: data.verification_token,
-        riderName: riderNameValue,
-        guarantorName: data.name,
-        guarantorPhone: data.phone_number,
+        token,
+        riderName: data.rider_name,
+        guarantorName: data.guarantor_name,
+        guarantorPhone: data.guarantor_phone,
         guarantorId: data.id,
       });
       setView("guarantor");
@@ -74,60 +78,119 @@ function App() {
     detectGuarantorRoute();
   }, [detectGuarantorRoute]);
 
-  const uploadFile = async (file: File, folder: string): Promise<string> => {
-    const ext = file.name.split(".").pop() || "bin";
-    const path = `${folder}/${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`;
-    const { error } = await supabase.storage.from("rider-uploads").upload(path, file, { upsert: false });
-    if (error) throw new Error(`Upload failed: ${error.message}`);
-    return path;
+  useEffect(() => {
+    const updateHash = () => setCurrentHash(window.location.hash);
+    window.addEventListener("hashchange", updateHash);
+    return () => window.removeEventListener("hashchange", updateHash);
+  }, []);
+
+  const captureRequiredLocation = async (): Promise<LocationData> => {
+    if (!window.isSecureContext) {
+      throw new Error("Location access requires HTTPS. Open this site using its secure HTTPS address and try again.");
+    }
+    if (!navigator.geolocation) {
+      throw new Error("Location is unavailable in this browser. Use an up-to-date mobile browser with location access enabled.");
+    }
+
+    const requestPosition = (options: PositionOptions) => new Promise<GeolocationPosition>((resolve, reject) => {
+      navigator.geolocation.getCurrentPosition(resolve, reject, options);
+    });
+
+    let position: GeolocationPosition;
+    try {
+      position = await requestPosition({ enableHighAccuracy: true, timeout: 12000, maximumAge: 60000 });
+    } catch (firstError) {
+      const locationError = firstError as GeolocationPositionError;
+      if (locationError.code === locationError.PERMISSION_DENIED) {
+        throw new Error("Location permission is blocked. Allow location for this site in your browser settings, then submit again.");
+      }
+      try {
+        position = await requestPosition({ enableHighAccuracy: false, timeout: 35000, maximumAge: 120000 });
+      } catch (fallbackError) {
+        const fallbackLocationError = fallbackError as GeolocationPositionError;
+        if (fallbackLocationError.code === fallbackLocationError.PERMISSION_DENIED) {
+          throw new Error("Location permission is blocked. Allow location for this site in your browser settings, then submit again.");
+        }
+        if (fallbackLocationError.code === fallbackLocationError.TIMEOUT) {
+          throw new Error("Your device took too long to determine its location. Turn on device location services, move near a window or outdoors, and try again.");
+        }
+        throw new Error("Your device could not determine its location. Turn on device location services and try again.");
+      }
+    }
+
+    return {
+      latitude: position.coords.latitude,
+      longitude: position.coords.longitude,
+      accuracy: position.coords.accuracy,
+      captured_at: new Date(position.timestamp).toISOString(),
+    };
   };
 
   const handleRiderSubmit = async (vals: RiderFormValues) => {
-    // Upload NIN document
-    let ninDocPath: string | undefined;
-    if (vals.nin_document) {
-      ninDocPath = await uploadFile(vals.nin_document, "nin-documents");
+    setSubmitting(true);
+    setSubmitError("");
+    try {
+      const location = await captureRequiredLocation();
+      await saveRiderApplication(vals, location);
+    } catch (submitFailure) {
+      setSubmitError(submitFailure instanceof Error ? submitFailure.message : "Could not submit application. Please try again.");
+    } finally {
+      setSubmitting(false);
     }
-    // Upload verification video
-    let videoPath: string | undefined;
-    if (vals.video) {
-      videoPath = await uploadFile(vals.video, "verification-videos");
-    }
+  };
 
-    // Insert rider
-    const { data: rider, error: riderErr } = await supabase
-      .from("riders")
-      .insert({
-        full_name: vals.full_name,
-        phone_number: vals.phone_number,
-        residential_address: vals.residential_address,
-        emergency_contact_name: vals.emergency_contact_name,
-        emergency_contact_phone: vals.emergency_contact_phone,
-        skills_experience: vals.skills_experience,
-        nin: vals.nin,
-        nin_document_path: ninDocPath,
-        video_path: videoPath,
-      })
-      .select("id")
-      .single();
-
-    if (riderErr || !rider) throw new Error("Failed to save rider profile. Please try again.");
-
-    // Insert guarantors with auto-generated single-use tokens
-    const guarantorRows = [
-      { rider_id: rider.id, name: vals.guarantor1.name, phone_number: vals.guarantor1.phone_number },
-      { rider_id: rider.id, name: vals.guarantor2.name, phone_number: vals.guarantor2.phone_number },
-    ];
-
-    const { data: guarantorData, error: guarantorErr } = await supabase
-      .from("guarantors")
-      .insert(guarantorRows)
-      .select("id, name, phone_number, verification_token");
-
-    if (guarantorErr || !guarantorData) throw new Error("Failed to generate guarantor links. Please try again.");
+  const saveRiderApplication = async (vals: RiderFormValues, location: LocationData) => {
+    const rider = {
+      full_name: vals.full_name,
+      date_of_birth: vals.date_of_birth,
+      place_of_birth: vals.place_of_birth,
+      state_of_origin: vals.state_of_origin,
+      state_of_origin_city: vals.state_of_origin_city,
+      state_of_origin_address: vals.state_of_origin_address,
+      phone_number: vals.phone_number,
+      email_address: vals.email_address,
+      residential_address: vals.residential_address,
+      residential_state: vals.residential_state,
+      residential_city: vals.residential_city,
+      residential_postal_code: vals.residential_postal_code,
+      emergency_contact_name: vals.emergency_contact_name,
+      emergency_contact_phone: vals.emergency_contact_phone,
+      relationship_to_emergency_contact: vals.relationship_to_emergency_contact,
+      marital_status: vals.marital_status,
+      has_delivery_experience: vals.has_delivery_experience,
+      employment_history: vals.employment_history,
+      communication_skills: vals.communication_skills,
+      motorcycle_safety: vals.motorcycle_safety,
+      motorcycle_maintenance: vals.motorcycle_maintenance,
+      health_challenge: vals.health_challenge,
+      health_details: vals.health_details,
+      skills_experience: vals.skills_experience,
+      nin: vals.nin,
+      location_latitude: location.latitude,
+      location_longitude: location.longitude,
+      location_accuracy_meters: location.accuracy,
+      location_captured_at: location.captured_at,
+      work_policy_accepted: vals.work_policy_accepted,
+      terms_accepted: vals.terms_accepted,
+      terms_signature: vals.terms_signature,
+    };
+    const formData = new FormData();
+    formData.append("rider", JSON.stringify(rider));
+    formData.append("guarantors", JSON.stringify([vals.guarantor1, vals.guarantor2]));
+    if (vals.nin_document) formData.append("rider_nin_document", vals.nin_document);
+    if (vals.identity_card_front) formData.append("rider_identity_card_front", vals.identity_card_front);
+    if (vals.identity_card_back) formData.append("rider_identity_card_back", vals.identity_card_back);
+    if (vals.video) formData.append("rider_video", vals.video);
+    const data = await apiRequest<{
+      guarantors: Array<{ name: string; phone_number: string; verification_token: string }>;
+      telegram_notification: "sent" | "not_configured" | "failed";
+    }>("/api/applications", {
+      method: "POST",
+      body: formData,
+    });
 
     const origin = window.location.origin + window.location.pathname;
-    const linkInfos: GuarantorLinkInfo[] = guarantorData.map((g) => ({
+    const linkInfos: GuarantorLinkInfo[] = data.guarantors.map((g: { name: string; phone_number: string; verification_token: string }) => ({
       guarantorName: g.name,
       guarantorPhone: g.phone_number,
       riderName: vals.full_name,
@@ -136,45 +199,57 @@ function App() {
 
     setLinks(linkInfos);
     setRiderName(vals.full_name);
+    setTelegramWarning(data.telegram_notification === "failed"
+      ? "Your application was saved, but the administrator notification could not be sent. The application is still received."
+      : "");
     setView("success");
     window.scrollTo({ top: 0, behavior: "smooth" });
   };
 
   const handleGuarantorSubmit = async (submission: GuarantorSubmission) => {
+    setSubmitting(true);
+    setSubmitError("");
+    try {
+      const location = await captureRequiredLocation();
+      await saveGuarantorApplication(submission, location);
+      setView("guarantor-complete");
+    } catch (submitFailure) {
+      setSubmitError(submitFailure instanceof Error ? submitFailure.message : "Could not submit verification. Please try again.");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const saveGuarantorApplication = async (submission: GuarantorSubmission, location: LocationData) => {
     if (!guarantorCtx) return;
 
-    // Upload guarantor NIN document
-    let ninDocPath: string | undefined;
-    if (submission.nin_document) {
-      ninDocPath = await uploadFile(submission.nin_document, "guarantor-nin-documents");
-    }
-
-    // Upload guarantor video declaration
-    let videoPath: string | undefined;
-    if (submission.video) {
-      videoPath = await uploadFile(submission.video, "guarantor-videos");
-    }
-
-    const { error } = await supabase
-      .from("guarantors")
-      .update({
-        status: "submitted",
-        submitted_at: new Date().toISOString(),
-        guarantor_address: submission.guarantor_address,
-        guarantor_phone_confirmed: submission.guarantor_phone,
-        relationship: submission.relationship,
-        occupation: submission.occupation,
-        nin: submission.nin,
-        nin_document_path: ninDocPath,
-        video_path: videoPath,
-        digital_signature: submission.digital_signature,
-        confirmation: submission.confirmation,
-      })
-      .eq("id", guarantorCtx.guarantorId)
-      .eq("verification_token", guarantorCtx.token)
-      .eq("status", "pending"); // double check still pending — prevents reuse
-
-    if (error) throw new Error("Could not submit verification. Please try again.");
+    const formData = new FormData();
+    formData.append("payload", JSON.stringify({
+      guarantor_address: submission.guarantor_address,
+      guarantor_state: submission.guarantor_state,
+      guarantor_city: submission.guarantor_city,
+      guarantor_postal_code: submission.guarantor_postal_code,
+      state_of_origin: submission.state_of_origin,
+      state_of_origin_city: submission.state_of_origin_city,
+      state_of_origin_address: submission.state_of_origin_address,
+      guarantor_phone_confirmed: submission.guarantor_phone,
+      relationship: submission.relationship,
+      occupation: submission.occupation,
+      nin: submission.nin,
+      digital_signature: submission.digital_signature,
+      confirmation: submission.confirmation,
+      work_policy_accepted: submission.work_policy_accepted,
+      location_latitude: location.latitude,
+      location_longitude: location.longitude,
+      location_accuracy_meters: location.accuracy,
+      location_captured_at: location.captured_at,
+    }));
+    if (submission.nin_document) formData.append("guarantor_nin_document", submission.nin_document);
+    if (submission.video) formData.append("guarantor_video", submission.video);
+    await apiRequest<{ success: boolean }>(`/api/guarantors/${encodeURIComponent(guarantorCtx.token)}`, {
+      method: "POST",
+      body: formData,
+    });
   };
 
   const handleNewApplication = () => {
@@ -187,52 +262,38 @@ function App() {
 
   // ===== Renders =====
 
+  if (currentHash === "#/admin" || window.location.pathname === "/admin" || window.location.pathname.startsWith("/admin/")) {
+    const adminPath = window.location.pathname;
+    const activePage = adminPath === "/admin/content" ? "content" : adminPath === "/admin/users" ? "users" : adminPath === "/admin/notifications" ? "notifications" : "dashboard";
+    return <div className="admin-area">
+      <nav className="admin-tabs" aria-label="Administrator sections">
+        <a className={activePage === "dashboard" ? "active" : ""} href="/admin/dashboard">Rider applications</a>
+        <a className={activePage === "content" ? "active" : ""} href="/admin/content">Form content</a>
+        <a className={activePage === "users" ? "active" : ""} href="/admin/users">Administrators</a>
+        <a className={activePage === "notifications" ? "active" : ""} href="/admin/notifications">Notifications</a>
+      </nav>
+      {activePage === "content" || activePage === "users" || activePage === "notifications"
+        ? <AdminManagementPage page={activePage} />
+        : <AdminDashboard />}
+    </div>;
+  }
+
   if (loadingGuarantor) {
     return (
-      <div className="min-h-screen bg-slate-50 flex items-center justify-center">
-        <Loader2 className="h-8 w-8 animate-spin text-brand-600" />
-      </div>
+      <div className="loading-screen"><Loader2 className="spin" /><span>Loading verification…</span></div>
     );
   }
 
   if (view === "guarantor-error") {
-    return (
-      <div className="min-h-screen bg-slate-50 flex items-center justify-center px-4">
-        <div className="max-w-md rounded-2xl border border-slate-200 bg-white p-8 text-center shadow-soft">
-          <div className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-full bg-red-50">
-            <AlertCircle className="h-7 w-7 text-red-500" />
-          </div>
-          <h1 className="text-lg font-bold text-slate-800">Link Not Found</h1>
-          <p className="mt-2 text-sm text-slate-500">
-            This guarantor verification link is invalid or has expired. Please contact the rider or
-            Vanguard Velocity Delivery for assistance.
-          </p>
-          <div className="mt-6 flex items-center justify-center gap-2 text-sm font-semibold text-slate-400">
-            <Truck className="h-4 w-4" /> Vanguard Velocity Delivery
-          </div>
-        </div>
-      </div>
-    );
+    return <Message title="Link not found" body="This guarantor verification link is invalid or has expired. Contact the rider or Vanguard Velocity Delivery for assistance." />;
   }
 
   if (view === "guarantor-used") {
-    return (
-      <div className="min-h-screen bg-slate-50 flex items-center justify-center px-4">
-        <div className="max-w-md rounded-2xl border border-slate-200 bg-white p-8 text-center shadow-soft">
-          <div className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-full bg-amber-50">
-            <AlertCircle className="h-7 w-7 text-amber-500" />
-          </div>
-          <h1 className="text-lg font-bold text-slate-800">Link Already Used</h1>
-          <p className="mt-2 text-sm text-slate-500">
-            This guarantor verification link has already been submitted. Each link is single-use. If you
-            believe this is an error, please contact Vanguard Velocity Delivery.
-          </p>
-          <div className="mt-6 flex items-center justify-center gap-2 text-sm font-semibold text-slate-400">
-            <Truck className="h-4 w-4" /> Vanguard Velocity Delivery
-          </div>
-        </div>
-      </div>
-    );
+    return <Message title="Link already used" body="This guarantor verification link has already been submitted. Each link is single-use. Contact Vanguard Velocity Delivery if you believe this is an error." />;
+  }
+
+  if (view === "guarantor-complete") {
+    return <Message title={text("Verification received")} body={text("Thank you. Your guarantor verification has been securely submitted.")} />;
   }
 
   if (view === "guarantor" && guarantorCtx) {
@@ -240,11 +301,10 @@ function App() {
       <div className="min-h-screen bg-slate-50 py-8 px-4">
         <div className="mx-auto max-w-xl">
           <GuarantorForm
-            token={guarantorCtx.token}
-            riderName={guarantorCtx.riderName}
-            guarantorName={guarantorCtx.guarantorName}
-            guarantorPhone={guarantorCtx.guarantorPhone}
+            context={guarantorCtx}
             onSubmit={handleGuarantorSubmit}
+            busy={submitting}
+            error={submitError}
           />
         </div>
       </div>
@@ -254,7 +314,7 @@ function App() {
   if (view === "success") {
     return (
       <div className="min-h-screen bg-slate-50 py-8 px-4">
-        <SuccessScreen riderName={riderName} links={links} onNewApplication={handleNewApplication} />
+        <SuccessScreen riderName={riderName} links={links} onNewApplication={handleNewApplication} notificationWarning={telegramWarning} />
       </div>
     );
   }
@@ -262,12 +322,16 @@ function App() {
   // Default: rider form
   return (
     <div className="min-h-screen bg-slate-50 py-8 px-4">
-      <div className="mx-auto max-w-3xl space-y-5">
+      <div className="mx-auto max-w-3xl">
         <RiderHeader />
-        <RiderForm onSubmit={handleRiderSubmit} />
+        <RiderForm onSubmit={handleRiderSubmit} busy={submitting} error={submitError} />
       </div>
     </div>
   );
+}
+
+function Message({ title, body }: { title: string; body: string }) {
+  return <main className="message-screen"><section className="message-panel"><AlertCircle aria-hidden="true" /><h1>{title}</h1><p>{body}</p><a href="/">Vanguard Velocity Delivery</a></section></main>;
 }
 
 export default App;

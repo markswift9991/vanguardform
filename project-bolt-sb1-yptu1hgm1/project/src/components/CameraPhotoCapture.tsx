@@ -1,18 +1,26 @@
 import { useRef, useState, useEffect, useCallback } from "react";
-import { Camera, RefreshCw, Upload, CheckCircle2, AlertCircle, X } from "lucide-react";
+import { Camera, RefreshCw, Upload, CheckCircle2, AlertCircle, X, ScanLine } from "lucide-react";
+import { useFormContent } from "../lib/useFormContent";
 
-interface CameraPhotoCaptureProps {
-  onCapture: (file: File) => void;
+interface DocumentScannerProps {
+  onCapture: (file: File | null) => void;
+  documentLabel: string;
   capturedPreview?: string;
 }
 
-export function CameraPhotoCapture({ onCapture, capturedPreview }: CameraPhotoCaptureProps) {
+export function DocumentScanner({ onCapture, documentLabel, capturedPreview }: DocumentScannerProps) {
+  const { text } = useFormContent();
   const videoRef = useRef<HTMLVideoElement>(null);
+  const scannerViewRef = useRef<HTMLDivElement>(null);
+  const scanFrameRef = useRef<HTMLDivElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const previewRef = useRef<string>();
   const [streamActive, setStreamActive] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [starting, setStarting] = useState(false);
+  const [localPreview, setLocalPreview] = useState<string>();
+  const [videoAspectRatio, setVideoAspectRatio] = useState("4 / 3");
 
   const stopStream = useCallback(() => {
     if (streamRef.current) {
@@ -22,12 +30,21 @@ export function CameraPhotoCapture({ onCapture, capturedPreview }: CameraPhotoCa
     setStreamActive(false);
   }, []);
 
+  const captureFile = useCallback((file: File | null) => {
+    if (previewRef.current) URL.revokeObjectURL(previewRef.current);
+    previewRef.current = file ? URL.createObjectURL(file) : undefined;
+    setLocalPreview(previewRef.current);
+    if (!file && fileInputRef.current) fileInputRef.current.value = "";
+    if (file) stopStream();
+    onCapture(file);
+  }, [onCapture, stopStream]);
+
   const startCamera = useCallback(async () => {
     setStarting(true);
     setError(null);
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } },
+        video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 } },
         audio: false,
       });
       streamRef.current = stream;
@@ -36,55 +53,86 @@ export function CameraPhotoCapture({ onCapture, capturedPreview }: CameraPhotoCa
         await videoRef.current.play();
       }
       setStreamActive(true);
-    } catch (err) {
+    } catch {
+      stopStream();
       setError(
-        "Could not access the camera. Please grant camera permission or use the upload option below."
+        text("Could not access the camera. Please grant camera permission or choose an image below.")
       );
     } finally {
       setStarting(false);
     }
-  }, []);
+  }, [stopStream, text]);
 
   const capture = useCallback(() => {
     const video = videoRef.current;
-    if (!video || !streamRef.current) return;
+    const scannerView = scannerViewRef.current;
+    const scanFrame = scanFrameRef.current;
+    if (!video || !scannerView || !scanFrame || !streamRef.current) return;
+    if (!video.videoWidth || !video.videoHeight) {
+      setError(text("The scanner camera is not ready yet. Please wait and try again."));
+      return;
+    }
+    const viewBounds = scannerView.getBoundingClientRect();
+    const frameBounds = scanFrame.getBoundingClientRect();
+    const scale = Math.min(viewBounds.width / video.videoWidth, viewBounds.height / video.videoHeight);
+    const displayedWidth = video.videoWidth * scale;
+    const displayedHeight = video.videoHeight * scale;
+    const offsetX = (viewBounds.width - displayedWidth) / 2;
+    const offsetY = (viewBounds.height - displayedHeight) / 2;
+    const sourceX = Math.max(0, (frameBounds.left - viewBounds.left - offsetX) / scale);
+    const sourceY = Math.max(0, (frameBounds.top - viewBounds.top - offsetY) / scale);
+    const sourceWidth = Math.min(video.videoWidth - sourceX, frameBounds.width / scale);
+    const sourceHeight = Math.min(video.videoHeight - sourceY, frameBounds.height / scale);
     const canvas = document.createElement("canvas");
-    canvas.width = video.videoWidth || 1024;
-    canvas.height = video.videoHeight || 768;
+    canvas.width = Math.round(sourceWidth);
+    canvas.height = Math.round(sourceHeight);
     const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    if (!ctx) {
+      setError(text("Could not prepare the document scan. Please try again."));
+      return;
+    }
+    ctx.drawImage(video, sourceX, sourceY, sourceWidth, sourceHeight, 0, 0, canvas.width, canvas.height);
     canvas.toBlob((blob) => {
-      if (!blob) return;
-      const file = new File([blob], `nin-doc-${Date.now()}.jpg`, { type: "image/jpeg" });
-      onCapture(file);
+      if (!blob) {
+        setError(text("Could not create the document scan. Please try again."));
+        return;
+      }
+      const file = new File([blob], `identity-scan-${Date.now()}.jpg`, { type: "image/jpeg" });
+      captureFile(file);
       stopStream();
     }, "image/jpeg", 0.9);
-  }, [onCapture, stopStream]);
+  }, [captureFile, stopStream, text]);
 
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (file) onCapture(file);
+    if (file) captureFile(file);
   };
 
   useEffect(() => {
     return () => stopStream();
   }, [stopStream]);
 
-  if (capturedPreview) {
+  useEffect(() => {
+    return () => {
+      if (previewRef.current) URL.revokeObjectURL(previewRef.current);
+    };
+  }, []);
+
+  const preview = capturedPreview ?? localPreview;
+  if (preview) {
     return (
       <div className="space-y-3">
         <div className="relative overflow-hidden rounded-xl border border-slate-200 bg-slate-50">
-          <img src={capturedPreview} alt="NIN document" className="max-h-72 w-full object-contain" />
+          <img src={preview} alt={`${documentLabel} scan`} className="max-h-72 w-full object-contain" />
           <button
             type="button"
-            onClick={() => onCapture(new File([], "clear"))}
+            onClick={() => captureFile(null)}
             className="absolute right-3 top-3 rounded-lg bg-white/90 px-3 py-1.5 text-xs font-semibold text-slate-700 shadow-sm transition hover:bg-white"
           >
-            Retake
+            {text("Scan again")}
           </button>
           <div className="absolute left-3 top-3 flex items-center gap-1.5 rounded-lg bg-emerald-500/90 px-3 py-1.5 text-xs font-semibold text-white">
-            <CheckCircle2 className="h-3.5 w-3.5" /> Captured
+            <CheckCircle2 className="h-3.5 w-3.5" /> {text("Scan captured")}
           </div>
         </div>
       </div>
@@ -92,22 +140,30 @@ export function CameraPhotoCapture({ onCapture, capturedPreview }: CameraPhotoCa
   }
 
   return (
-    <div className="space-y-3">
-      <div className="relative overflow-hidden rounded-xl border border-slate-200 bg-slate-900 aspect-[4/3] flex items-center justify-center">
+    <div className="document-scanner">
+      <p className="document-scanner-instructions"><ScanLine size={16} aria-hidden="true" /> {text("Place the full [document] inside the frame. Keep it flat, well lit, and in focus. Review the scan to confirm all details are clear.").replaceAll("[document]", documentLabel.toLowerCase())}</p>
+      <div ref={scannerViewRef} className="document-scanner-view" style={{ aspectRatio: videoAspectRatio }}>
         {streamActive ? (
-          <video ref={videoRef} playsInline muted className="h-full w-full object-cover" />
+          <video
+            ref={videoRef}
+            playsInline
+            muted
+            aria-label={`${documentLabel} camera preview`}
+            onLoadedMetadata={(event) => setVideoAspectRatio(`${event.currentTarget.videoWidth} / ${event.currentTarget.videoHeight}`)}
+          />
         ) : (
-          <div className="flex flex-col items-center gap-3 text-slate-400">
-            <Camera className="h-10 w-10" />
-            <p className="text-sm">{starting ? "Starting camera..." : "Camera preview"}</p>
+          <div className="document-scanner-placeholder">
+            <Camera size={40} aria-hidden="true" />
+            <p>{starting ? text("Starting scanner...") : text("Document scanner preview")}</p>
           </div>
         )}
+        <div ref={scanFrameRef} className="document-scan-frame" aria-hidden="true" />
         {streamActive && (
           <button
             type="button"
             onClick={stopStream}
             className="absolute right-3 top-3 rounded-lg bg-black/50 p-1.5 text-white transition hover:bg-black/70"
-            aria-label="Close camera"
+            aria-label={text("Close camera")}
           >
             <X className="h-4 w-4" />
           </button>
@@ -130,7 +186,7 @@ export function CameraPhotoCapture({ onCapture, capturedPreview }: CameraPhotoCa
             className="inline-flex items-center gap-2 rounded-xl bg-brand-600 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-brand-700 disabled:opacity-60"
           >
             <Camera className="h-4 w-4" />
-            {starting ? "Starting..." : "Open Camera"}
+            {starting ? text("Starting...") : text("Open document scanner")}
           </button>
         ) : (
           <button
@@ -139,7 +195,7 @@ export function CameraPhotoCapture({ onCapture, capturedPreview }: CameraPhotoCa
             className="inline-flex items-center gap-2 rounded-xl bg-emerald-600 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-emerald-700"
           >
             <RefreshCw className="h-4 w-4" />
-            Capture Photo
+            {text("Scan document")}
           </button>
         )}
         <button
@@ -148,12 +204,12 @@ export function CameraPhotoCapture({ onCapture, capturedPreview }: CameraPhotoCa
           className="inline-flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-4 py-2.5 text-sm font-semibold text-slate-700 transition hover:bg-slate-50"
         >
           <Upload className="h-4 w-4" />
-          Upload Image
+          {text("Choose image")}
         </button>
         <input
           ref={fileInputRef}
           type="file"
-          accept="image/*"
+          accept="image/jpeg,image/png,image/webp"
           capture="environment"
           className="hidden"
           onChange={handleFileUpload}
